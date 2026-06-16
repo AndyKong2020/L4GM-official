@@ -2,131 +2,135 @@
 
 生成日期：2026-06-16
 
-## 分析结论
+## 绑定口径
 
-L4GM-official 在 Ascend950PR 与 `torch_npu 2.10.0` 环境下具备可适配运行基础，但不是开箱即用的全量 NPU 原生项目。项目核心 LGM recon/interp 网络主要由 PyTorch conv、linear、attention、interpolation、normalization 和 tensor reshape/reduce 组成，经过 CUDA device 假设清理后，checkpoint 加载、reduced forward、3D 推理和降帧 4D 推理均已在 NPU 上跑通。
+| 项 | 口径 |
+| --- | --- |
+| target_platform | Ascend 950PR |
+| NPU 架构版本 | 3510，分离架构，AIC:AIV=1:2，支持 Regbase AIV、SIMD/SIMT 混合、NDDMA、CV Fusion |
+| dtype | 推理主路径为 FP16/autocast；Gaussian 后处理、renderer fallback 和部分输出转 FP32；训练配置里的 bf16/LPIPS 未作为本轮实测口径 |
+| 任务阶段 | 非 LLM prefill/decode；按 ImageDream diffusion denoise、LGM 3D recon、LGM 4D temporal/interp、Gaussian render 四段分析 |
+| 运行边界 | 单进程单卡推理，后四张卡可见；没有做多卡并行、HCCL 或通信 overlap |
+| 对比 GPU | 本版不做 GPU 横向对比；只按 Ascend 950PR 亲和性给结论 |
 
-当前 NPU 亲和风险集中在三条链路：第一，ImageDream 的 CLIP text/image encoder 从 safetensors/diffusers loader 得到的 CPU tensor 直接 `.to(npu)` 会卡死，需要先在 CPU 侧 clone materialize；第二，项目原依赖 xFormers 与 `gsplat` 这类 CUDA 扩展，NPU 只能走 PyTorch fallback 或简化 renderer；第三，4D 默认 `num_frames=16` 在 PyTorch attention fallback 下会一次性构造约 64 GiB attention matrix，导致 HBM OOM。
+Ascend 950PR 的 FP16/BF16 Cube-only 峰值公开规格为约 432/378 TFLOPS，封装内存带宽约 1.6/1.4 TB/s，因此矩阵路径 FP16 粗平衡点约 270 FLOP/Byte。Vector FP16/BF16 峰值约 54/47 TFLOPS，向量路径平衡点约 34 FLOP/Byte。平衡点只作为 roofline 拐点，不是性能承诺；所有未上板 profile 的效率项均标 `待测`。
 
-因此，本次结论是：3D demo inference 已具备 NPU 功能可运行性；4D inference 在 `num_frames=4` 下可运行；README 默认 16 帧 4D 尚未完成 NPU 亲和，需要专门做 attention 内存优化和 renderer 替换后，才能声明完整配置适配。
+## 总体结论
 
-## 已验证的 NPU 友好路径
+L4GM-official 对 Ascend 950PR 不是全量原生亲和，但已经具备明确的可运行适配路径。基础 Conv2d、Linear、GroupNorm/LayerNorm、reshape、interpolate、matmul、softmax、VAE/UNet 和 scheduler tensor 操作可以支撑 `infer_3d.py big --num_frames 1` 完整跑通，也可以支撑 `infer_4d.py big --num_frames 4` 生成 4D 视频。
 
-本轮实测通过的路径说明项目主体并非被 NPU 算子全面阻塞。LGM recon/interp 模型可以加载 safetensors 权重并迁移到 NPU，`forward_gaussians` 在 reduced 输入下输出有限值。ImageDream 的 VAE、UNet 迁移到 NPU 正常，CLIP encoder 经 materialize 后也可以迁移并完成 1-step 多视图生成。
+当前不亲和点集中在三处：
 
-| NPU 功能/模块路径 | 实测状态 | 验证方式 | 边界说明 |
-| --- | --- | --- | --- |
-| NPU 设备发现与后四卡隔离 | 支持 | `ASCEND_RT_VISIBLE_DEVICES=4,5,6,7` 后 `torch.npu.device_count()==4` | 进程内 `npu:0..3` 映射到物理后四张卡；本轮主要使用单进程单卡。 |
-| LGM recon 模型 | 支持 | `recon.safetensors` 加载 `missing/unexpected=0`，reduced forward finite | 官方 3D 推理已跑通；视觉质量受 renderer fallback 影响。 |
-| LGM interp 模型 | 支持 | `interp.safetensors` 加载 `missing/unexpected=0`，reduced forward finite | 4D 降帧推理已跑通；16 帧受 attention HBM 阻塞。 |
-| ImageDream VAE/UNet | 支持 | `vae.to(npu)` 约 1.89 秒，`unet.to(npu)` 约 2.25 秒 | xFormers 不可用时走 PyTorch attention fallback。 |
-| ImageDream CLIP encoder materialize 后迁移 | 支持 | materialize 后 `text_encoder.to(npu)` 约 2.03 秒，`image_encoder.to(npu)` 约 2.04 秒 | 必须避开原始 checkpoint tensor 的直接 NPU copy 路径。 |
-| ImageDream 1-step 前向 | 支持 | 256x256 输入，`num_inference_steps=1` 输出 `(5, 256, 256, 3)`，finite True | 该测试验证 CLIP/VAE/UNet 调用链，不代表最终生成质量。 |
-| 官方 3D 推理入口 | 支持 | `infer_3d.py big --num_frames 1` 生成 PNG/MP4 | 当前 renderer fallback 可产出结果，但不等价于 CUDA `gsplat`。 |
-| 官方 4D 推理入口降帧 | 支持 | `infer_4d.py big --num_frames 4` 生成 4D 视频 | 说明 4D 代码链路可跑；默认 16 帧仍需降显存适配。 |
+1. ImageDream CLIP text/image encoder 的 checkpoint-backed CPU tensor 直接 `.to(npu)` 会卡死；经 CPU materialize 后可迁移并前向。
+2. `core/attention.py` 在 xFormers 不可用时走显式 PyTorch attention，16 帧 4D 的 temporal attention 在 `softmax` 处申请 64 GiB HBM，默认 README 4D 配置 OOM。
+3. CUDA `gsplat` 不可用，当前 NPU fallback 用 scatter/alpha 简化 rasterization，只能证明功能链路，不代表官方视觉质量。
 
-## 算子级亲和性矩阵
+## 五路径拆解
 
-下表按实际代码路径和本轮运行结果归纳算子亲和性。这里的“通过”表示该算子或算子组合已经出现在 NPU smoke、ImageDream 1-step、`infer_3d.py` 或 `infer_4d.py --num_frames 4` 成功链路中；“条件支持”表示功能可用但有显存、质量或前置 materialize 条件；“未验证”表示源码中存在但本轮没有进入该路径。
+| 子段 | Cube 压力 | Vector 压力 | MTE/FixPipe 压力 | communication | host/head | 亲和判定 | 证据与边界 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| ImageDream CLIP text/image encoder 权重迁移 | 无 | 无 | 高，checkpoint-backed CPU tensor 到 NPU copy 路径异常 | 无 | 中，卡在迁移阶段阻塞后续 launch | 原流程差；materialize 后中 | 原始 `text_encoder.to(npu)`、`image_encoder.to(npu)` 240s 超时；`detach().clone().contiguous()` 后约 2s 迁移。该问题是 MTE/host transfer 路径，不是 CLIP 算子本身不支持。 |
+| ImageDream diffusion denoise | 中，UNet 中 Linear/conv 与 attention matmul 可运行 | 中，LayerNorm/GroupNorm、softmax、scheduler step、guidance | 中，latents/context/camera 多次 cat/repeat 与 VAE encode/decode | 无 | 中，30-step diffusion 有循环 launch/head | 中 | 1-step 前向输出 finite；3D 入口 30-step diffusion 约 17 it/s。未做逐层 profile，Cube/Vector/MTE 效率 `待测`。 |
+| LGM 3D recon forward | 中高，Conv2d/Linear/attention matmul 是主计算 | 中，GroupNorm、SiLU、softplus/sigmoid/tanh/normalize、softmax | 中，view/reshape/permute 多但多数为 layout 元操作或 contiguous copy | 无 | 低到中，单样本推理 kernel 多 | 中高 | recon checkpoint missing/unexpected=0，forward finite；`infer_3d.py big --num_frames 1` 已生成 PNG/MP4。视觉质量受 renderer fallback 限制。 |
+| LGM 4D temporal/interp，`num_frames=4` | 中，Conv/attention matmul 可运行 | 中高，temporal attention softmax 和后处理 | 中，帧/视角 reshape、cat、视频输出搬运 | 无 | 中，循环处理 150 帧输入 | 中 | `infer_4d.py big --num_frames 4` 完整跑通并生成无插值/插值视频。 |
+| LGM 4D temporal，`num_frames=16` 原配置 | Cube 并非首要瓶颈 | 极高，显式 attention softmax workspace 峰值 | 高，attention matrix materialize 和 workspace 占 HBM | 无 | 中 | 差 | OOM 点在 `core/attention.py` 的 `attn.softmax(dim=-1)`，单次申请 64 GiB；换到空闲后卡仍失败。 |
+| Gaussian renderer fallback | 低，Cube 基本闲置 | 中，投影、比较、clamp、alpha blend | 中高，scatter_add、小包/离散访问、stack 输出 | 无 | 中，Python loop over view/batch | 功能中，质量低 | fallback 可生成结果，但 scatter/排序/alpha blending 属不规则负载；无 950 实测归档，吞吐和质量均 `待测`。 |
+| 训练/PSNR eval | 待测 | 待测 | 待测，dataloader/Objaverse tar 读放大 | 可能有，Accelerate gather | 高 | 未验证 | 仓库缺外部 Objaverse 数据与 datalist；不能报告 PSNR benchmark。 |
 
-| 算子/算子组合 | 代码路径 | NPU 状态 | 实测依据 | 风险边界 |
+## 算子级亲和性
+
+| 算子/组合 | 主导路径 | NPU 状态 | 证据 | 待测/风险 |
 | --- | --- | --- | --- | --- |
-| CPU tensor -> NPU tensor copy：`Tensor.to("npu")` | 权重迁移、输入迁移 | 条件支持 | 普通 float16/float32/int64 tensor、synthetic `Embedding/Linear/Conv2d` 权重可在约 2 秒迁移。 | safetensors/diffusers loader 得到的 CLIP weight 直接 `.to(npu)` 会超时，必须先 `detach().clone().contiguous()` materialize。 |
-| `clone`、`detach`、`contiguous`、`nn.Parameter` 重建 | `core/device.py` materialize helper | 支持 | CLIP text/image encoder materialize 后 `.to(npu)` 通过，完整 `pipe.to(npu)` 约 2.99 秒完成。 | 仅作为 NPU 迁移前处理；不是性能优化算子。 |
-| `Conv2d`、1x1/3x3 conv、stride conv | `core/unet.py`、`core/models.py`、ImageDream VAE/UNet | 支持 | LGM reduced forward、3D 推理、4 帧 4D 推理均通过；ImageDream 30-step diffusion 通过。 | `gsplat` 不是 Conv2d 路径，不能由此推断 renderer 质量。 |
-| `GroupNorm`、`LayerNorm` | LGM UNet、CLIP、ImageDream UNet/VAE | 支持 | 小型 LayerNorm 单独迁移通过；3D/4D 成功链路覆盖 GroupNorm；CLIP materialize 后 1-step 前向通过。 | 未做 CPU/NPU 数值逐层 parity，只做功能可运行验证。 |
-| 激活函数：`silu`、`softplus`、`sigmoid`、`tanh`、`clamp`、`normalize` | `core/unet.py`、`core/models.py`、`core/gs.py` | 支持 | LGM gaussian 输出后处理和渲染链路通过，输出 finite。 | `F.normalize` 用于 quaternion/rotation 归一化，未单独做数值误差评估。 |
-| shape/layout：`view`、`reshape`、`permute`、`transpose`、`contiguous`、`squeeze`、`unsqueeze` | LGM/4D temporal-view reshape、ImageDream pipeline | 支持 | 3D 与 4 帧 4D 完整通过，覆盖频繁 layout 变换。 | 主要是元数据/拷贝路径，风险低于 attention 和 renderer。 |
-| 拼接/堆叠：`cat`、`stack`、`repeat`、`repeat_interleave`、`chunk` | rays embedding、prompt/image embeds、latent batch 构造、4D 输出拼接 | 支持 | ImageDream 1-step、30-step 3D 推理和 4 帧 4D 推理通过。 | 大 batch/高帧数时会放大 HBM 占用。 |
-| resize：`F.interpolate` bilinear/nearest | 输入预处理、上采样、VAE latent image resize、视频输出 resize | 支持 | 3D/4D 推理通过，覆盖 bilinear 与 nearest。 | 训练数据增强里的更大输入未验证。 |
-| pooling：`AvgPool2d` | LGM DownBlock downsample 可选路径 | 支持但覆盖有限 | `big` 配置 forward 可进入下采样路径，3D/4D 推理通过。 | 未单独压测不同 dtype/shape。 |
-| Linear projection：`nn.Linear` | LGM attention qkv/proj、CLIP、ImageDream attention/MLP | 条件支持 | synthetic Linear 可迁移；CLIP materialize 后 1-step 前向通过；LGM forward 通过。 | CLIP checkpoint-backed Linear weight 直接 `.to(npu)` 会超时；需要 materialize。 |
-| embedding lookup：`nn.Embedding` | CLIP token embedding、ImageDream label/camera embedding | 条件支持 | synthetic `Embedding(49408,1024)` 可迁移；CLIP materialize 后前向通过。 | CLIP checkpoint-backed embedding weight 直接 `.to(npu)` 超时。 |
-| attention matmul：`q @ k.transpose`、`attn @ v`、`torch.matmul` | `core/attention.py`、`mvdream/mv_unet.py`、CLIP/ImageDream attention | 条件支持 | 3D、4 帧 4D、ImageDream 30-step diffusion 均通过。 | 随 token 数二次增长；16 帧 4D 的显存峰值来自 attention matrix。 |
-| `softmax(dim=-1)` | LGM MV/Temp attention、ImageDream attention | 条件支持/默认 16 帧阻塞 | 3D 和 4 帧 4D 通过；16 帧 4D 在 `attn.softmax(dim=-1)` 处申请 64 GiB 并 OOM。 | 需要 memory-efficient attention 或 chunk attention，不能继续依赖显式大矩阵。 |
-| random/scheduler tensor：`randn_tensor`、DDIM scheduler `set_timesteps/step/scale_model_input` | `mvdream/pipeline_mvdream.py` | 支持 | ImageDream 1-step 与 30-step 3D 推理通过。 | 未对随机一致性和速度做专项评估。 |
-| VAE encode/decode 分布采样 | ImageDream image latent encode/decode | 支持 | 1-step ImageDream 前向和 3D 推理通过。 | 仅功能验证，未做图像质量 parity。 |
-| 相机矩阵：`torch.inverse`、矩阵乘 `@`、`transpose` | `infer_3d.py`、`infer_4d.py`、dataset provider | 支持 | 3D 渲染对齐和 4D 输出路径通过。 | 仅小型 4x4 矩阵；不能代表大规模 linalg 亲和。 |
-| masking/indexing：比较、boolean mask、`round`、`long`、高级索引 | Gaussian fallback renderer | 支持 | fallback rasterizer 生成 PNG/MP4。 | 该路径功能可用但不是质量等价 renderer。 |
-| `scatter_add_` | Gaussian fallback renderer alpha/color splat | 支持但质量受限 | 3D 与 4D 降帧结果文件已生成。 | 当前 scatter splat 是简化实现，不包含官方 `gsplat` 的排序、覆盖和反走样。 |
-| `torch.zeros_like`、`torch.zeros`、`torch.ones` | ImageDream negative embeds、renderer buffers、背景色 | 支持 | 多条成功链路覆盖；仅观察到 base format warning，不影响功能。 | base format warning 可能影响性能，但未导致失败。 |
-| `mse_loss`、`mean`、`log10` | 训练/eval PSNR 路径 | 未验证 | 仓内 PSNR 路径需要外部 Objaverse 数据，本轮未进入。 | 不能报告训练指标或 PSNR benchmark。 |
-| `grid_sample` | `core/utils.py` grid distortion 数据增强 | 未验证 | 推理入口没有进入该训练增强路径。 | 训练适配时需要单独测试。 |
-| LPIPS/VGG | `core/models.py` 训练 loss | 未验证/推理禁用 | 推理中设置 `lambda_lpips=0`，避免额外权重下载。 | 训练若启用 LPIPS，需要验证 VGG 权重、算子和内存。 |
-| xFormers `memory_efficient_attention` | `core/attention.py` 原优先路径 | 阻塞/不可用 | 当前 Ascend 环境无 CUDA xFormers，已 fallback 到 PyTorch attention。 | 需要替换为 NPU 可用的 memory-efficient attention。 |
-| `gsplat.rendering.rasterization` | `core/gs.py` 原 renderer | 阻塞/不可用 | Ascend 环境无法加载 CUDA `gsplat`，当前使用 fallback。 | 完整视觉质量复现必须替换 renderer。 |
+| `Tensor.to("npu")` 普通 contiguous tensor | MTE/FixPipe | 支持 | float16/float32/int64 synthetic tensor、synthetic `Embedding/Linear/Conv2d` weight 均可迁移 | checkpoint-backed CLIP tensor 直接迁移会超时 |
+| `detach().clone().contiguous()` materialize | MTE/FixPipe + host/head | 支持 | CLIP weight clone 后 `.to(npu)` 约 1.9s，完整 `pipe.to(npu)` 约 3s | 额外 CPU 内存与一次性 copy 开销；建议作为加载期处理 |
+| `Conv2d` 1x1/3x3/stride conv | Cube + Vector | 支持 | LGM smoke、3D、4D 降帧通过；ImageDream VAE/UNet 可迁移和前向 | tile 利用率、L0/L1 驻留未 profile |
+| `nn.Linear` / qkv projection | Cube | 条件支持 | LGM/CLIP/ImageDream 前向通过；synthetic Linear 迁移通过 | CLIP checkpoint-backed weight 需 materialize |
+| `nn.Embedding` | MTE + Vector | 条件支持 | synthetic `Embedding(49408,1024)` 可迁移；CLIP materialize 后前向通过 | checkpoint-backed embedding 直接迁移超时 |
+| `GroupNorm`、`LayerNorm` | Vector | 支持 | 3D/4D 成功链路覆盖；小型 LayerNorm 单独迁移通过 | repeat/mask 密度和 aiv_vec_time `待测` |
+| `SiLU`、`softplus`、`sigmoid`、`tanh`、`clamp`、`F.normalize` | Vector | 支持 | Gaussian 参数后处理输出 finite | Vector SFU/elementwise 效率 `待测` |
+| `view/reshape/permute/transpose/contiguous` | MTE/FixPipe 或元操作 | 支持但需折叠判断 | 3D/4D 多处 layout 变换成功 | view 不计 GM 搬运；contiguous copy 才计真实字节，需 profile 区分 |
+| `cat/stack/repeat/repeat_interleave/chunk` | MTE/FixPipe | 支持 | diffusion latent/context、rays embedding、4D 输出拼接通过 | 高帧数下会放大 HBM 和 copy 次数 |
+| `F.interpolate` bilinear/nearest | Vector + MTE | 支持 | 输入 resize、上采样、VAE latent resize、视频输出路径通过 | 大 batch/训练增强未测 |
+| `q @ k.T`、`attn @ v` | Cube | 条件支持 | 3D、4 帧 4D、ImageDream 30-step 跑通 | 算术密度高，但显式矩阵 HBM 峰值会掩盖 Cube 上限 |
+| `softmax(dim=-1)` attention | Vector + MTE | 条件支持/16 帧阻塞 | 3D 和 4 帧 4D 通过；16 帧 4D OOM | 需要 online/chunk/memory-efficient attention；不能继续显式 materialize 大矩阵 |
+| DDIM scheduler `set_timesteps/scale_model_input/step`、`randn_tensor` | Vector + MTE + head | 支持 | ImageDream 1-step 和 30-step 通过 | scheduler 小算子 launch/head 占比 `待测` |
+| VAE encode/decode | Cube + Vector + MTE | 支持 | ImageDream 1-step、3D 推理通过 | 质量 parity 未测 |
+| `torch.inverse` 小型 4x4、矩阵乘 `@` | Cube/Vector | 支持 | camera view/proj 生成与渲染路径通过 | 仅小矩阵，不外推大 linalg |
+| 比较、boolean mask、高级索引、`round/long` | Vector + MTE | 支持 | Gaussian fallback renderer 可出图 | 不规则访问效率 `待测` |
+| `scatter_add_` | Vector/SIMT 候选 + MTE | 功能支持，亲和偏低 | fallback renderer 生成文件 | 950 支持 SIMD/SIMT 不规则负载候选，但 scatter/atomic 冲突吞吐无实测归档 |
+| `mse_loss/mean/log10` PSNR | Vector/reduce | 未验证 | 训练 eval 未跑 | 需 Objaverse 数据后测 |
+| `grid_sample` | Vector + MTE | 未验证 | 只在训练增强路径 | 推理未覆盖，训练需单独 microbench |
+| LPIPS/VGG | Cube + Vector + MTE | 未验证/推理禁用 | 推理设置 `lambda_lpips=0` | 启用训练 LPIPS 需要权重、算子和 HBM 验证 |
+| xFormers `memory_efficient_attention` | Cube + Vector | 不可用 | Ascend 环境无 CUDA xFormers | 需 NPU 等价实现 |
+| CUDA `gsplat.rendering.rasterization` | Vector/SIMT + MTE | 不可用 | 当前使用 fallback | 需要 NPU 原生/等价 renderer |
 
-从算子角度看，项目不是缺少基础 Conv/Linear/Norm/MatMul 能力，而是被两个“组合路径”限制：一是 checkpoint-backed tensor 的 NPU copy path，二是 attention 显式矩阵在 16 帧 4D 下的 HBM 峰值。前者已经通过 materialize 规避；后者仍是完整默认配置的主阻塞。
+## Roofline 粗估
 
-## 阻塞项分析
+### Attention
 
-### ImageDream CLIP tensor 迁移卡死
+显式 attention 的 matmul 部分通常有较高算术密度，理论上更接近 Cube 路径；但本项目当前失败点不是 Cube FLOPs，而是 `attn = q @ k.T` 后保留完整 `[B, heads, N, N]` attention matrix，并在 `softmax` 处需要大 HBM workspace。
 
-最初的端到端阻塞表现为 `MVDreamPipeline.from_pretrained(...)` 能在本地权重上约 1 秒完成，但 `pipe.to(npu)` 多分钟不返回，`infer_3d.py` 因此无法进入 `[INFO] Processing` 和文件输出阶段。组件拆分后，`vae.to(npu)` 与 `unet.to(npu)` 都在约 2 秒内完成；`text_encoder.to(npu)` 和 `image_encoder.to(npu)` 均 240 秒超时。
+以 LGM temporal attention 为例，令 `N = num_frames * H * W`，FP16 attention matrix 至少约 `groups * heads * N^2 * 2B`。`num_frames=16` 时，中间分辨率若达到 `H=W=32`，仅 FP16 attention matrix 就是数十 GiB；softmax 若使用 FP32/额外 workspace，峰值可翻倍到与实测 64 GiB OOM 同量级。因此该段亲和性不是“矩阵算术密度高所以好”，而是 Cube 算力可用但 Vector softmax + MTE/HBM materialization 共同主导。
 
-进一步拆分显示，CLIP 的大型 embedding 和 transformer block 子模块会超时，小型 LayerNorm 可以迁移。基础 dtype 与形状测试排除了“Ascend 不支持该形状”的解释：同形状 synthetic `Embedding(49408, 1024)`、`Linear(1024, 4096)`、`Linear(1280, 5120)`、patch `Conv2d` 都能约 2 秒迁移到 NPU。真正卡住的是从 checkpoint loader 得到的 CLIP 权重 tensor 直接 `.to(npu)`。
+结论：`num_frames=4` 的 attention 峰值仍能落入单卡可承受范围，所以 4D 降帧跑通；`num_frames=16` 必须改为 online softmax、chunk attention、scaled-dot-product/memory-efficient attention 或降低 token 分辨率，才能恢复 NPU 亲和。
 
-关键对照结果如下：
+### Conv/Linear 主干
 
-| 测试对象 | 直接 `.to(npu)` | `detach().clone().contiguous().to(npu)` |
-| --- | --- | --- |
-| `text_encoder.text_model.embeddings.token_embedding.weight` | 90 秒超时 | 约 1.93 秒完成 |
-| `text_encoder` layer 0 `q_proj.weight` | 90 秒超时 | 约 1.94 秒完成 |
-| `image_encoder` patch embedding weight | 90 秒超时 | 约 1.90 秒完成 |
-| `image_encoder` layer 0 `q_proj.weight` | 90 秒超时 | 约 1.90 秒完成 |
+LGM recon/interp 的 Conv2d/Linear 主干在 FP16 下应使用 Cube 路径。与 950PR FP16 Cube 平衡点约 270 FLOP/Byte 相比，3x3 Conv 和大 Linear 在合理 tile 下具备较高算术密度，初判不是主要瓶颈。风险在于 U-Net 多尺度 feature、skip concat、view/temporal reshape 可能引入额外 MTE copy，实际效率需通过 profile 拆出 Cube time、Vector time 和 GM bytes。
 
-因此判断为 safetensors/diffusers/Transformers loader 产生的 CPU tensor backing 与 torch-npu copy path 不兼容。当前适配是在 `core/device.py` 中提供 `materialize_cpu_module_tensors()`，并在 `mvdream/pipeline_mvdream.py` 中对 `text_encoder` 和 `image_encoder` 的 NPU 迁移做预处理。适配后，完整 `pipe.to(npu)` 约 2.99 秒完成，1-step ImageDream 前向通过。
+结论：主干 Conv/Linear 为中高亲和，待测项是 tile 驻留、double buffer 和 layout copy 占比。
 
-### xFormers 缺失与 PyTorch attention fallback
+### Renderer fallback
 
-项目原 attention 路径优先使用 xFormers memory efficient attention。Ascend NPU 环境不能使用 CUDA xFormers，因此当前走 `core/attention.py` 中的 PyTorch fallback：先计算 `attn = q @ k.transpose(-2, -1)`，再执行 `attn.softmax(dim=-1)`。这条路径功能上可运行，但显式 materialize attention matrix，显存复杂度为 token 数的二次方。
+Gaussian fallback renderer 主要是投影、小矩阵乘、mask、scatter_add 和 alpha blend，Cube 基本闲置，更多落在 Vector/MTE 或 950 的 SIMT/mixed 候选模型。3DGS 类负载中的排序、tile binning、scatter、atomic、早退分支属于不规则高风险项；当前 skill 的 measured 归档为空，因此不能编造 scatter/atomic 吞吐。
 
-3D 与 4 帧 4D 可以接受这条 fallback；16 帧 4D 则会在 temporal attention 上触发 HBM OOM。OOM 点明确位于 `core/attention.py` 的 softmax，错误信息为申请 64 GiB HBM；在空闲后卡上复测时，模型已占约 36.93 GiB active，当前空闲约 45.31 GiB，无法满足单次 64 GiB 分配。
+结论：fallback renderer 功能亲和中等、性能/质量亲和偏低；若目标是官方视觉质量，应单独设计 NPU 版 Gaussian rasterizer 并上板 microbench。
 
-这说明完整 16 帧 4D 的关键不是简单换卡或清 cache，而是必须避免一次性构造大 attention matrix。可选方向包括实现 NPU 可用的 memory-efficient attention、按 temporal/spatial token chunk、降低 token 分辨率，或重构 4D 处理流程让 recon/interp 分阶段释放模型与激活。
+## NPU 特有亲和项检查
 
-### CUDA-only Gaussian rasterizer
+| 检查项 | 本项目结论 |
+| --- | --- |
+| tile 驻留与 double buffer | Conv/Linear 主干需要 profile 验证 L0/L1/UB 驻留；当前功能已跑通但没有 tile 利用率数据。16 帧 attention 的主问题是 `N^2` matrix 不可驻留，不能靠扩大融合解决。 |
+| 32B/512B/128B sector 对齐 | 950PR 采用 512B L2 cacheline + 4x128B sector；本轮未做 packet/alignment microbench。报告不沿用 A2 的 512B GM 对齐曲线。 |
+| repeat/mask 密度 | Norm/activation/softmax、renderer mask/scatter 都需要 aiv_vec_time 或 microbench。当前只确认功能。 |
+| layout 折叠 | `view/reshape/permute` 优先按元操作或地址变换处理；只有 `contiguous`、`cat/stack/repeat` 等真实 materialization 计入 GM bytes。16 帧 attention 的 `N^2` matrix 不能视作可折叠 layout。 |
+| reduce/state layout | 训练 PSNR、MSE、LPIPS 和 reducer 未进入本轮测试；需单独验证 reduce 轴和 state layout。 |
+| 同步边界 | 当前单进程单卡，无 HCCL/CCU/URMA；4D 循环存在 host/head 和多 kernel launch，但没有通信同步。 |
+| host/head | ImageDream 30-step diffusion 和 4D 视频循环有明显多 step launch/head；功能通过，性能占比待 profile。 |
+| 不规则负载 | renderer fallback 的 scatter_add/mask 属不规则路径，3510 可考虑 SIMD/SIMT mixed，但原语效率无归档实测，必须标 `待测`。 |
 
-`core/gs.py` 原始路径依赖 `gsplat.rendering.rasterization`。该扩展在当前 Ascend 环境不可用，因此已加入简化 fallback rasterization，使用投影、scatter 和 alpha blending 在 NPU 上产出图像。这解决了功能链路阻塞，使 `infer_3d.py` 与降帧 `infer_4d.py` 能生成文件。
+## 数学等价/流程重写建议
 
-该 fallback 不是质量等价实现。它缺少 `gsplat` 的完整 splat 覆盖、排序、可微/反走样和高质量 alpha 合成能力，不能作为官方视觉结果对齐依据。若后续目标是论文/README 级视觉复现，需要 NPU 原生 Gaussian rasterizer 或跨平台等价 renderer。
+当前判低亲和的段必须尝试重写，不能停留在原流程：
 
-### 官方 4D 默认帧数显存阻塞
-
-`infer_4d.py big --num_frames 16` 在物理后四卡内映射到空闲 NPU 后仍报 OOM，错误为在 attention softmax 处申请 64 GiB。把 `num_frames` 降为 4 后，完整 `infer_4d.py` 可以跑通并生成无插值、插值与 fixed 视角视频。这验证了 4D 链路本身可迁移，阻塞集中在默认帧数下 attention matrix 的显存峰值。
-
-当前 16 帧配置不能通过环境变量或更换后卡根治。即使单卡 HBM 约 112 GiB，模型、激活、runtime reserve 与单个 64 GiB attention 分配叠加后仍超出可用连续空间。后续适配应以降低 attention 峰值为主，而不是继续尝试下载、重装或清理系统盘。
-
-## 模块级 NPU 亲和矩阵
-
-| 项目能力 | NPU 亲和状态 | 依据 | 后续工作 |
+| 原流程问题 | 重写方向 | 五路径变化 | 精度/风险 |
 | --- | --- | --- | --- |
-| 环境与缓存 | 高 | cache/权重/输出均可放挂载盘，后四卡可见。 | 保持 `scripts/npu_env.sh` 作为统一入口。 |
-| LGM recon forward | 高 | checkpoint load 与 NPU forward 通过，3D 推理完成。 | 若追求质量，需要 renderer 对齐。 |
-| LGM interp forward | 中 | reduced forward 与 4 帧 4D 通过。 | 16 帧需 attention 优化。 |
-| ImageDream VAE/UNet | 中高 | 迁移和 1-step 前向通过。 | 进一步做 30-step 质量/性能采样。 |
-| ImageDream CLIP encoders | 中 | 原 tensor 迁移卡死，materialize 后通过。 | 保留 materialize 补丁；后续可定位 torch-npu 与 safetensors backing 的底层兼容问题。 |
-| Attention | 中低 | PyTorch fallback 功能可用，但 16 帧 OOM。 | 实现 memory-efficient attention 或 chunk attention。 |
-| Gaussian rasterization | 低 | `gsplat` 不可用，当前 fallback 只保功能。 | 替换为 NPU 原生/等价 renderer。 |
-| 训练与 PSNR eval | 未验证 | 需要外部 Objaverse 数据与 datalist。 | 补数据后单独验证 dataloader、loss、PSNR 和多卡训练。 |
-| 多卡并行 | 未验证 | 当前推理单进程单卡；只验证后四卡可见。 | 若要利用 4 张卡，需要新增并行策略，当前代码不会自动分摊单样本显存。 |
+| 16 帧 temporal attention 显式 materialize `[N,N]` | online softmax / chunk attention / blockwise attention，保持数学等价的 softmax 累积 | 降低 MTE/HBM 峰值，Cube matmul 分块执行，Vector softmax 变为分块 reduce | 需与原 PyTorch attention 做误差对齐；FP32 accumulator 后回写 FP16 |
+| xFormers CUDA kernel 不可用 | 替换为 NPU 可用 SDPA 或自定义 AscendC memory-efficient attention | 恢复 Cube/Vector/MTE 流水，避免显式大矩阵 | API 支持和性能 `待测` |
+| CLIP checkpoint-backed tensor 迁移卡死 | 加载后 CPU materialize，再一次性迁移；或在 loader 层禁用 mmap/backing 特性 | 从卡死的 MTE/host path 变为普通 contiguous copy | 已验证功能；额外加载期内存开销可接受 |
+| Gaussian fallback 质量不等价 | 设计 tile binning + depth sort + alpha blend 的 NPU renderer，或持久化可排序 tile layout | 从 Python loop + scatter fallback 转为 SIMD/SIMT mixed；减少 host/head | 排序、atomic、scatter 冲突吞吐必须上板测 |
+| 4D recon/interp 同时驻留 | 分阶段加载/释放或模块 offload；forward 后释放不再使用的模型和激活 | 降低 HBM baseline，为 attention workspace 留空间 | 只能增加余量，不能单独解决 64 GiB attention matrix |
 
-## 能否适配跑通
+## 待测清单
 
-可以适配跑通，但要区分“功能跑通”和“官方默认完整配置跑通”。
+1. 使用 profiler 拆 `infer_3d.py big` 的 Cube time、Vector time、MTE bytes、kernel launch/head，确认 Conv/Linear 主干是否接近预期 Cube 路径。
+2. 对 `core/attention.py` 做 `num_frames=4/8/12/16` 梯度测试，记录 attention matrix/workspace 峰值与 OOM 阈值。
+3. 上板 microbench `softmax`、`qk matmul + softmax + av matmul` 的 chunk/online 实现，比较显式 attention fallback。
+4. 对 CLIP materialize 路径记录加载期 CPU 内存峰值和迁移耗时，确认不同 safetensors 文件均稳定。
+5. 对 renderer fallback 的 `scatter_add_`、mask、boolean indexing 做 3510 microbench；当前无 measured 归档，效率全部 `待测`。
+6. 若需要训练/PSNR，补齐 Objaverse 数据后单独验证 `mse_loss/mean/log10`、LPIPS/VGG、`grid_sample` 和 dataloader I/O。
+7. 若要多卡，单独验证 HCCL/CCU/框架 collective；本轮没有通信路径结论。
 
-当前已经跑通的范围是：ImageDream 多视图生成、LGM 3D 推理、LGM 4D 降帧推理，均在 Ascend NPU 上完成并生成文件。关键适配点是 CLIP encoder materialize、CUDA device 假设替换、xFormers fallback 和 renderer fallback。
+## 结论表
 
-尚未跑通的是 README 默认 16 帧 4D 配置。这个阻塞已经定位到 temporal attention 的 64 GiB 单次分配，而不是权重缺失、网络下载、系统盘空间、NPU 可见性或某个 checkpoint 损坏。只要仍使用当前 PyTorch fallback attention，16 帧配置大概率继续 OOM。
+| 子段 | 主导路径 | 算术密度 vs 平衡点 | 亲和结论 | 基于流程 | 待测 |
+| --- | --- | --- | --- | --- | --- |
+| ImageDream CLIP 权重迁移 | MTE/FixPipe + host/head | 不适用 | 原流程差，materialize 后中 | 基于等价加载流程重写 | loader/backing 根因、加载期内存 |
+| ImageDream diffusion | Cube + Vector + MTE | Conv/attention 部分高；scheduler/elementwise 低 | 中 | 当前 NPU fallback 流程 | profile 分轨、质量 parity |
+| LGM 3D recon | Cube 主导，Vector/MTE 辅助 | Conv/Linear 初判高于 Cube 平衡点，layout bytes 待测 | 中高 | 当前流程 | tile 驻留、renderer 替换 |
+| LGM 4D `num_frames=4` | Cube + Vector + MTE | 可承受范围内 | 中 | 当前流程 | 性能 profile |
+| LGM 4D `num_frames=16` | Vector softmax + MTE/HBM 主导 | 显式 attention matrix 使 HBM 峰值压倒 Cube 算力 | 差 | 原流程 | memory-efficient/chunk attention |
+| Gaussian renderer fallback | Vector/MTE/SIMT 候选 | 不规则负载，不用 Cube 平衡点判断 | 功能中，质量/性能低 | 当前 fallback | scatter/atomic/sort microbench |
+| 训练/PSNR | Vector/reduce + I/O | 待测 | 未验证 | 原训练流程 | 数据、LPIPS、grid_sample、reduce |
 
-要把 16 帧配置推进到可交付状态，建议按以下优先级处理：
-
-1. 在 `core/attention.py` 为 NPU 增加 memory-efficient attention 路径，避免显式创建完整 `[B, heads, N, N]` attention matrix。
-2. 如果后端 attention 能力不足，按 token 或时间维做 chunk，先保证数值可接受，再评估速度。
-3. 将 `infer_4d.py` 中 recon 与 interp 模型分阶段驻留，forward 后释放无关模型和中间 tensor，降低非 attention HBM 占用。
-4. 保留 `num_frames=4` 作为当前 NPU smoke/回归配置，后续每次改 attention 后先跑 4 帧，再逐步拉到 8、12、16 帧。
-5. 替换 renderer fallback，建立 CUDA `gsplat` 与 NPU renderer 的图像/视频对齐检查，否则即使 16 帧跑通，也不能声明视觉质量等价。
-
-## 结论
-
-L4GM-official 的 NPU 适配不是被整体框架或模型权重阻断。经过针对性 patch，3D 和降帧 4D 已经可以在 NPU 上产出结果，说明主干模型和 ImageDream 组件具备可迁移性。剩余核心问题是 16 帧 4D 的 attention 显存峰值和 CUDA rasterizer 替代；这两个问题解决前，不应对外宣称完整 README 配置和官方视觉质量已经在 NPU 上复现。
+本轮亲和性结论不替代上板 profile。当前可对外陈述的是：Ascend 950PR 上 3D 推理和 4 帧 4D 推理已功能跑通；完整 README 默认 16 帧 4D 的主要阻塞是显式 attention 的 HBM 峰值与 CUDA renderer 替代，不是基础 Conv/Linear/Norm 算子缺失。
