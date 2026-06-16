@@ -35,12 +35,17 @@ from kiui.cam import orbit_camera
 
 from core.options import AllConfigs, Options
 from core.models import LGM
+from core.device import configure_cache_dirs, device_autocast, empty_cache, get_torch_device
+
+configure_cache_dirs()
+
 from mvdream.pipeline_mvdream import MVDreamPipeline
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 opt = tyro.cli(AllConfigs)
+opt.lambda_lpips = 0
 
 # model
 model = LGM(opt)
@@ -57,11 +62,11 @@ else:
     print(f'[WARN] model randomly initialized, are you sure?')
 
 # device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = get_torch_device()
 model = model.half().to(device)
 model.eval()
 
-bg_color = torch.tensor([255, 255, 255], dtype=torch.float32, device="cuda") / 255.
+bg_color = torch.tensor([255, 255, 255], dtype=torch.float32, device=device) / 255.
 
 rays_embeddings = model.prepare_default_rays(device)
 
@@ -74,11 +79,13 @@ proj_matrix[3, 2] = - (opt.zfar * opt.znear) / (opt.zfar - opt.znear)
 proj_matrix[2, 3] = 1
 
 # load image dream
+imagedream_model_path = os.environ.get("IMAGEDREAM_MODEL_PATH", "ashawkey/imagedream-ipmv-diffusers")
+imagedream_is_local = os.path.isdir(imagedream_model_path)
 pipe = MVDreamPipeline.from_pretrained(
-    "ashawkey/imagedream-ipmv-diffusers", # remote weights
+    imagedream_model_path,
     torch_dtype=torch.float16,
     trust_remote_code=True,
-    # local_files_only=True,
+    local_files_only=imagedream_is_local,
 )
 pipe = pipe.to(device)
 
@@ -130,7 +137,7 @@ def process(opt: Options, path):
     input_image = torch.cat([input_image, rays_embeddings], dim=1).unsqueeze(0) # [1, 4, 9, H, W]
 
     with torch.no_grad():
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        with device_autocast(device, dtype=torch.float16):
             gaussians_all_frame = model.forward_gaussians(input_image)
             
             B, T, V = 1, gaussians_all_frame.shape[0]//opt.batch_size, opt.num_views
@@ -219,7 +226,7 @@ def process(opt: Options, path):
             imageio.mimwrite(os.path.join(opt.workspace, f'{name}.mp4'), images, fps=30)
 
 
-    torch.cuda.empty_cache()
+    empty_cache()
 
 
 

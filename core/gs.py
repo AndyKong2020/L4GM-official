@@ -23,13 +23,72 @@ from core.options import Options
 
 import kiui
 
-from gsplat.rendering import rasterization
+try:
+    from gsplat.rendering import rasterization
+except ImportError:
+    rasterization = None
+
+
+def _fallback_rasterization(
+    means,
+    quats,
+    scales,
+    opacities,
+    colors,
+    viewmats,
+    Ks,
+    width,
+    height,
+    near_plane,
+    far_plane,
+    backgrounds=None,
+    **kwargs,
+):
+    device = means.device
+    dtype = means.dtype
+    ones = torch.ones(means.shape[0], 1, device=device, dtype=dtype)
+    means_h = torch.cat([means, ones], dim=-1)
+
+    rendered_images = []
+    rendered_alphas = []
+    for view_idx in range(viewmats.shape[0]):
+        cam = means_h @ viewmats[view_idx].to(device=device, dtype=dtype).T
+        z = cam[:, 2]
+        valid = (z > near_plane) & (z < far_plane)
+        z_safe = z.clamp_min(1e-4)
+
+        K = Ks[view_idx].to(device=device, dtype=dtype)
+        px = cam[:, 0] / z_safe * K[0, 0] + K[0, 2]
+        py = cam[:, 1] / z_safe * K[1, 1] + K[1, 2]
+        ix = px.round().long()
+        iy = py.round().long()
+        valid = valid & (ix >= 0) & (ix < width) & (iy >= 0) & (iy < height)
+
+        image_flat = torch.zeros(height * width, 3, device=device, dtype=torch.float32)
+        alpha_flat = torch.zeros(height * width, 1, device=device, dtype=torch.float32)
+        if valid.any():
+            idx = (iy[valid] * width + ix[valid]).long()
+            alpha = opacities[valid].float().unsqueeze(-1).clamp(0, 1)
+            color = colors[valid].float().clamp(0, 1)
+            image_flat.scatter_add_(0, idx[:, None].expand(-1, 3), color * alpha)
+            alpha_flat.scatter_add_(0, idx[:, None], alpha)
+
+        alpha_flat = alpha_flat.clamp(0, 1)
+        image_flat = image_flat / alpha_flat.clamp_min(1e-6)
+        if backgrounds is not None:
+            bg = backgrounds[view_idx].to(device=device, dtype=torch.float32)
+            image_flat = image_flat * alpha_flat + bg.view(1, 3) * (1 - alpha_flat)
+
+        rendered_images.append(image_flat.view(height, width, 3))
+        rendered_alphas.append(alpha_flat.view(height, width, 1))
+
+    return torch.stack(rendered_images, dim=0), torch.stack(rendered_alphas, dim=0), {"fallback": True}
 
 class GaussianRenderer:
     def __init__(self, opt: Options):
         
         self.opt = opt
-        self.bg_color = torch.tensor([1, 1, 1], dtype=torch.float32, device="cuda")
+        self.bg_color = torch.tensor([1, 1, 1], dtype=torch.float32)
         
         # intrinsics
         self.tan_half_fov = np.tan(0.5 * np.deg2rad(self.opt.fovy))
@@ -41,7 +100,7 @@ class GaussianRenderer:
         self.proj_matrix[2, 3] = 1
 
         f = self.opt.output_size / (2 * self.tan_half_fov)
-        self.K = torch.tensor([[f, 0., self.opt.output_size/2.], [0., f, self.opt.output_size/2.], [0., 0., 1.]], dtype=torch.float32, device="cuda")
+        self.K = torch.tensor([[f, 0., self.opt.output_size/2.], [0., f, self.opt.output_size/2.], [0., 0., 1.]], dtype=torch.float32)
 
     def render(self, gaussians, cam_view, cam_view_proj, cam_pos, bg_color=None):
         # gaussians: [B, N, 14]
@@ -50,6 +109,8 @@ class GaussianRenderer:
 
         device = gaussians.device
         B, V = cam_view.shape[:2]
+        K = self.K.to(device)
+        bg = self.bg_color.to(device) if bg_color is None else bg_color.to(device)
 
         # loop of loop...
         images = []
@@ -71,20 +132,21 @@ class GaussianRenderer:
             viewmat = view_matrix.transpose(2, 1) # [V, 4, 4]
 
             
-            rendered_image_all, rendered_alpha_all, info = rasterization(
+            rasterizer = rasterization or _fallback_rasterization
+            rendered_image_all, rendered_alpha_all, info = rasterizer(
                 means=means3D,
                 quats=rotations,
                 scales=scales,
                 opacities=opacity.squeeze(-1),
                 colors=rgbs,
                 viewmats=viewmat,
-                Ks=torch.stack([self.K for _ in range(V)]),
+                Ks=torch.stack([K for _ in range(V)]),
                 width=self.opt.output_size,
                 height=self.opt.output_size,
                 near_plane=self.opt.znear,
                 far_plane=self.opt.zfar,
                 packed=False,
-                backgrounds=torch.stack([self.bg_color for _ in range(V)]) if self.bg_color is not None else None,
+                backgrounds=torch.stack([bg for _ in range(V)]),
                 render_mode="RGB",
             )
             for rendered_image, rendered_alpha in zip(rendered_image_all, rendered_alpha_all):

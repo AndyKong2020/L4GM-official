@@ -36,9 +36,12 @@ from kiui.cam import orbit_camera
 
 from core.options import AllConfigs, Options
 from core.models import LGM
+from core.device import configure_cache_dirs, device_autocast, empty_cache, get_torch_device
 import time
 
 from core.utils import get_rays, grid_distortion, orbit_camera_jitter
+
+configure_cache_dirs()
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
@@ -49,6 +52,7 @@ MAX_RUNS = 100
 VIDEO_FPS = 30
 
 opt = tyro.cli(AllConfigs)
+opt.lambda_lpips = 0
 
 # model
 model = LGM(opt)
@@ -65,11 +69,11 @@ else:
     print(f'[WARN] model randomly initialized, are you sure?')
 
 # device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = get_torch_device()
 model = model.half().to(device)
 model.eval()
 
-bg_color = torch.tensor([255, 255, 255], dtype=torch.float32, device="cuda") / 255.
+bg_color = torch.tensor([255, 255, 255], dtype=torch.float32, device=device) / 255.
 
 
 rays_embeddings = model.prepare_default_rays(device)
@@ -91,7 +95,7 @@ else:
     print(f'[WARN] model_interp randomly initialized, are you sure?')
 
 # device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = get_torch_device()
 model_interp = model_interp.half().to(device)
 model_interp.eval()
 
@@ -177,7 +181,7 @@ def process(opt: Options, path):
     
 
     with torch.inference_mode():
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        with device_autocast(device, dtype=torch.float16):
             start_t = 0
             gaussians_all_frame_all_run = []
             gaussians_all_frame_all_run_w_interp = []
@@ -372,7 +376,7 @@ def process(opt: Options, path):
 
                 images = np.concatenate(images, axis=0)
 
-                torch.cuda.empty_cache()
+                empty_cache()
 
 
                 imageio.mimwrite(os.path.join(opt.workspace, f'{sv_name}_{name}_fixed.mp4'), render_img_TV, fps=ANIM_FPS)

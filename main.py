@@ -20,6 +20,7 @@ import random
 import torch
 from core.options import AllConfigs
 from core.models import LGM
+from core.device import empty_cache, memory_info
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from safetensors.torch import load_file
@@ -153,8 +154,9 @@ def main():
             if accelerator.is_main_process:
                 # logging
                 if i % 10 == 0:
-                    mem_free, mem_total = torch.cuda.mem_get_info()    
-                    print(f"[INFO] {i}/{len(train_dataloader)} mem: {(mem_total-mem_free)/1024**3:.2f}/{mem_total/1024**3:.2f}G lr: {scheduler.get_last_lr()[0]:.7f} step_ratio: {step_ratio:.4f} loss: {loss.item():.6f} time: {time.time() - end_time:.6f}")
+                    mem = memory_info()
+                    mem_text = "n/a" if mem is None else f"{(mem[1]-mem[0])/1024**3:.2f}/{mem[1]/1024**3:.2f}G"
+                    print(f"[INFO] {i}/{len(train_dataloader)} mem: {mem_text} lr: {scheduler.get_last_lr()[0]:.7f} step_ratio: {step_ratio:.4f} loss: {loss.item():.6f} time: {time.time() - end_time:.6f}")
                     end_time = time.time()
                 
                 # save log images
@@ -261,7 +263,7 @@ def main():
                     else:
                         raise NotImplementedError
 
-            torch.cuda.empty_cache()
+            empty_cache()
 
             total_psnr = accelerator.gather_for_metrics(total_psnr).mean()
             if accelerator.is_main_process:

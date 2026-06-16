@@ -15,6 +15,7 @@ from diffusers.configuration_utils import FrozenDict
 from diffusers.schedulers import DDIMScheduler
 from diffusers.utils.torch_utils import randn_tensor
 
+from core.device import is_npu_device, materialize_cpu_module_tensors
 from mvdream.mv_unet import MultiViewUNetModel, get_camera
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -23,6 +24,51 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 class MVDreamPipeline(DiffusionPipeline):
 
     _optional_components = ["feature_extractor", "image_encoder"]
+    _npu_materialize_components = ("text_encoder", "image_encoder")
+
+    def _empty_device_cache(self):
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _extract_to_device(self, args, kwargs):
+        device = kwargs.get("device")
+        if device is not None:
+            return torch.device(device)
+
+        for arg in args:
+            if isinstance(arg, torch.device):
+                return arg
+            if isinstance(arg, str):
+                try:
+                    return torch.device(arg)
+                except RuntimeError:
+                    continue
+        return None
+
+    def _prepare_npu_transfer(self, device):
+        if not is_npu_device(device):
+            return
+        for name in self._npu_materialize_components:
+            module = getattr(self, name, None)
+            if module is not None:
+                materialize_cpu_module_tensors(module)
+
+    def _move_component_to_device(self, name, device):
+        module = getattr(self, name, None)
+        if module is None:
+            return None
+        if is_npu_device(device) and name in self._npu_materialize_components:
+            materialize_cpu_module_tensors(module)
+        module = module.to(device=device)
+        setattr(self, name, module)
+        return module
+
+    def to(self, *args, **kwargs):
+        device = self._extract_to_device(args, kwargs)
+        self._prepare_npu_transfer(device)
+        return super().to(*args, **kwargs)
 
     def __init__(
         self,
@@ -128,11 +174,11 @@ class MVDreamPipeline(DiffusionPipeline):
                 "`enable_sequential_cpu_offload` requires `accelerate v0.14.0` or higher"
             )
 
-        device = torch.device(f"cuda:{gpu_id}")
+        device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "npu:0")
 
         if self.device.type != "cpu":
             self.to("cpu", silence_dtype_warnings=True)
-            torch.cuda.empty_cache()  # otherwise we don't see the memory savings (but they probably exist)
+            self._empty_device_cache()
 
         for cpu_offloaded_model in [self.unet, self.text_encoder, self.vae]:
             cpu_offload(cpu_offloaded_model, device)
@@ -151,11 +197,11 @@ class MVDreamPipeline(DiffusionPipeline):
                 "`enable_model_offload` requires `accelerate v0.17.0` or higher."
             )
 
-        device = torch.device(f"cuda:{gpu_id}")
+        device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "npu:0")
 
         if self.device.type != "cpu":
             self.to("cpu", silence_dtype_warnings=True)
-            torch.cuda.empty_cache()  # otherwise we don't see the memory savings (but they probably exist)
+            self._empty_device_cache()
 
         hook = None
         for cpu_offloaded_model in [self.text_encoder, self.unet, self.vae]:
@@ -446,11 +492,13 @@ class MVDreamPipeline(DiffusionPipeline):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         num_frames: int = 4,
-        device=torch.device("cuda:0"),
+        device=None,
     ):
-        self.unet = self.unet.to(device=device)
-        self.vae = self.vae.to(device=device)
-        self.text_encoder = self.text_encoder.to(device=device)
+        if device is None:
+            device = self.device
+        self._move_component_to_device("unet", device)
+        self._move_component_to_device("vae", device)
+        self._move_component_to_device("text_encoder", device)
 
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
@@ -464,7 +512,7 @@ class MVDreamPipeline(DiffusionPipeline):
         # imagedream variant
         if image is not None:
             assert isinstance(image, np.ndarray) and image.dtype == np.float32
-            self.image_encoder = self.image_encoder.to(device=device)
+            self._move_component_to_device("image_encoder", device)
             image_embeds_neg, image_embeds_pos = self.encode_image(image, device, num_images_per_prompt)
             image_latents_neg, image_latents_pos = self.encode_image_latents(image, device, num_images_per_prompt)
             

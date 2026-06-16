@@ -11,9 +11,13 @@ from einops import rearrange, repeat
 from diffusers.configuration_utils import ConfigMixin
 from diffusers.models.modeling_utils import ModelMixin
 
-# require xformers!
-import xformers
-import xformers.ops
+def memory_efficient_attention(q, k, v, attn_bias=None, op=None):
+    if attn_bias is not None:
+        raise AssertionError("attention bias requires xFormers")
+    scale = q.shape[-1] ** -0.5
+    attn = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+    attn = attn.softmax(dim=-1).to(v.dtype)
+    return torch.matmul(attn, v)
 
 from kiui.cam import orbit_camera
 
@@ -199,7 +203,7 @@ class MemoryEfficientCrossAttention(nn.Module):
         )
 
         # actually compute the attention, what we cannot get enough of
-        out = xformers.ops.memory_efficient_attention(
+        out = memory_efficient_attention(
             q, k, v, attn_bias=None, op=self.attention_op
         )
 
@@ -213,7 +217,7 @@ class MemoryEfficientCrossAttention(nn.Module):
                 (k_ip, v_ip),
             )
             # actually compute the attention, what we cannot get enough of
-            out_ip = xformers.ops.memory_efficient_attention(
+            out_ip = memory_efficient_attention(
                 q, k_ip, v_ip, attn_bias=None, op=self.attention_op
             )
             out = out + self.ip_weight * out_ip
